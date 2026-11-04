@@ -1,0 +1,83 @@
+# CLAUDE.md — working on deck
+
+`deck` is a pared-down PowerPoint for presentations that are plain HTML files (reveal.js). Read
+README.md first for what it does and the file format. This file is for changing it.
+
+## Ground rules
+
+- **Standard library only.** `deck.py` must run with a stock Python 3.8+: no pip packages, no npm at
+  runtime. Optional helpers are external programs found at run time (Chrome for PDF/PNG) or checked with a
+  clear message (lxml + Pillow for PowerPoint import). Keep it that way.
+- **The single file is the product.** Users get `dist/deck`, one Python file with the editor JS/CSS,
+  reveal.js, fonts, KaTeX and pptx2reveal embedded as base64. Never edit `deck.js` or `dist/deck` by hand:
+  `deck.js` is assembled from `engine/editor.js` + `parts/*.js` by `parts/assemble.py`, and `dist/deck`
+  by `build_single.py`. After any change: `make build` (then `make install` to update `~/bin/deck`).
+- **The presentation file belongs to the user.** Saving must keep untouched slides byte-for-byte (the
+  `rawSlides` mechanism in the engine) and never write editor state (`contenteditable`, `.re-*`,
+  `--fs`, `src` copied from `data-src`) into the file; `cleanClone` / `tidyMarkup` take care of this —
+  route new markup through them. Previous versions go to `_backups/`.
+- **Presentations present without the tool.** Everything a slide needs lives in the HTML file plus
+  `lib/`, `fonts/`, `media/` next to it. Any feature that needs script or CSS at show time adds it to the
+  file (see how `#deck-page`, `#deck-katex-render` and `#deck-links` are injected), never to the editor only.
+- **Stay expressible in PowerPoint terms.** A `.pptx` export is planned. New element kinds must map to
+  PowerPoint objects: absolutely positioned boxes, text runs with explicit styling, preset shapes,
+  pictures (crop as percentages), media, tables, groups, connectors. Record what the exporter will need in
+  `data-*` attributes rather than deriving it from rendered output.
+- **Work on both trees.** The editor keeps two DOMs: the live reveal.js slides (what the user sees) and
+  `srcDoc` (the parsed file). Elements are matched by index path (`srcOf(live)`); any change to the live
+  tree must be mirrored (`syncStyle`, `syncAttrs`, `syncWhole`, `syncFrame`, or a `slideOp` on the source
+  followed by `rebuildLive`). Take a `snapshot()` before a change so ⌘Z works, and `markDirty()` after.
+- **Foreign decks.** `deck` also opens presentations from `pptx2reveal` and `reveal-edit` that have no
+  `#deck-meta`. Guard deck-only features with `isDeck()` and offer `adoptDeck()` instead of failing.
+
+## Where things are
+
+| area | file |
+|---|---|
+| server, CLI, `deck new`, new-deck scaffold (page CSS/JS, themes, layouts, master), PDF/PNG/zip/single-file export, pptx import | `deck.py` |
+| editing engine: selection, multi-select, move/resize, shapes & lines, clipboard across decks, slide ops, undo, notes, serialize/save | `engine/editor.js` (shared with reveal-edit; patched in `parts/assemble.py`) |
+| settings (`META`), theme CSS, master stamping / master mode, layouts & placeholders, presenting | `parts/model.js` |
+| paragraphs, bullets & levels, font size/family/colour, B/I/U, line spacing, anchor, autofit, Enter/Tab/Backspace while typing | `parts/text.js` |
+| group/ungroup, align/distribute, rotation & flips, picture crop, connectors (`data-from`/`data-to`) | `parts/arrange.js` |
+| filmstrip, slide panel (layout, background, transition, hidden), builds panel, picture/video options | `parts/panels.js` |
+| toolbar, menus, dialogs (new deck, settings), shortcuts help, chrome layout, editor preferences | `parts/ui.js` |
+| tables, equations (KaTeX), links, find & replace, copy/paste style, export & import dialogs | `parts/phase2.js` |
+| editor look | `deck.css` |
+| what goes into every new presentation | `vendor/` (reveal.js, fonts), `vendor_opt/` (KaTeX, on first equation) |
+
+`parts/assemble.py` is the seam: it concatenates the parts into the engine and applies string patches
+(`rep(old, new)`) where engine functions must learn about deck features (e.g. `topItem` skipping master
+elements, `onKey` shortcuts, `placeOverlay` rotation). A patch asserts its anchor text occurs exactly once,
+so an engine edit that breaks an anchor fails loudly at build time — fix the anchor, don't delete the patch.
+
+## Conventions in the markup
+
+- Element: `<div class="e …" data-id="n" style="left;top;width;height[;transform]">`, ids unique per slide
+  (`nextId`, `ensureId`). Text: `.tx` (box, flex column, `justify-content` = vertical anchor, `data-autofit`)
+  › `.tb` › `.p` paragraphs (`data-bu="dot|num"`, `data-lvl="1..4"`, inline spans for runs). Placeholders
+  carry `data-ph="title|subtitle|body|caption|picture"`, `data-empty` while empty, `data-prompt` on the `.p`.
+- Shapes: `.shp` with `data-shape`, `data-fill`, `data-stroke`, `data-sw`, `data-dash`, `data-arrow`,
+  `data-line="x1,y1,x2,y2"`; the `<svg class="geo">` is regenerated by `renderShape()` — never edit it.
+- Master elements: `data-master` (+ `data-layout`, `data-slidenum`); they are copies of
+  `<template id="deck-master">`, re-stamped by `stampMaster()` on save. Don't make them selectable outside
+  master mode.
+- Builds: reveal `fragment` classes + `data-fragment-index`; `appear` is deck's no-transition kind.
+- Theme values are CSS variables (`--dk-text`, `--dk-title`, `--dk-font`, …) so switching light/dark
+  recolours placeholders; user-chosen colours are literal.
+
+## Testing
+
+`make test` builds and runs `tests/run.sh` (Playwright + Chromium: `pip install playwright &&
+playwright install chromium`). `t1` covers a new presentation end to end, `t4` phase-2 features, `t2`
+needs a reveal-edit editor on port 8801 (cross-tool paste), `t3` a converted deck on 8822. Tests drive the
+real editor in a browser; when adding a feature, add a check to the matching test rather than a unit test.
+Queries in tests must scope to `.reveal .slides .present …` — the filmstrip holds clones of every slide.
+
+Manual checks worth doing after UI changes: a 1440-px-wide window (the two toolbar rows must not wrap),
+the converted deck (`deck path/to/index.html` from pptx2reveal), ⌘Z after the change, save + reload.
+
+## Releasing to the user's machine
+
+`make install` runs `install.sh`: `~/bin/deck` (shebang pointing at the found `python3`), PATH line in
+the shell rc if needed, and on macOS `~/Applications/Deck.app` (an AppleScript droplet calling
+`deck --gui`). Bump `VERSION` in `deck.py` when behaviour changes; `deck --version` prints it.
